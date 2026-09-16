@@ -1,0 +1,195 @@
+// ============================================================
+// FP16 Multiplier
+// ============================================================
+
+module fp16_mult53 (
+    input  logic        clk53,
+    input  logic        rst53,
+    input  logic [15:0] a53,
+    input  logic [15:0] b53,
+    output logic [15:0] prod53
+);
+
+    // --------------------------------------------------------
+    // Stage 1: Unpack and Multiply
+    // --------------------------------------------------------
+
+    logic        sign_a53;
+    logic        sign_b53;
+    logic        sign_p1_53;
+
+    logic [4:0]  exp_a53;
+    logic [4:0]  exp_b53;
+    logic [5:0]  exp_p1_53;
+
+    logic [10:0] frac_a53;
+    logic [10:0] frac_b53;
+    logic [21:0] frac_p1_53;
+
+    always_ff @(posedge clk53 or posedge rst53) begin
+
+        if (rst53) begin
+            sign_p1_53 <= 1'b0;
+            exp_p1_53  <= 6'b0;
+            frac_p1_53 <= 22'b0;
+        end
+
+        else begin
+
+            // Unpack FP16 operands
+            sign_a53 = a53[15];
+            sign_b53 = b53[15];
+
+            exp_a53 = a53[14:10];
+            exp_b53 = b53[14:10];
+
+            // Add hidden bit for normalized numbers
+            frac_a53 = (|exp_a53) ?
+                       {1'b1, a53[9:0]} :
+                       11'b0;
+
+            frac_b53 = (|exp_b53) ?
+                       {1'b1, b53[9:0]} :
+                       11'b0;
+
+            // Calculate sign, exponent, and mantissa
+            sign_p1_53 <= sign_a53 ^ sign_b53;
+
+            exp_p1_53 <= exp_a53 + exp_b53 - 5'd15;
+
+            frac_p1_53 <= frac_a53 * frac_b53;
+        end
+    end
+
+
+    // --------------------------------------------------------
+    // Stage 2: Normalization
+    // --------------------------------------------------------
+
+    logic        sign_p2_53;
+    logic [5:0]  exp_p2_53;
+    logic [21:0] frac_p2_53;
+
+    always_ff @(posedge clk53 or posedge rst53) begin
+
+        if (rst53) begin
+            sign_p2_53 <= 1'b0;
+            exp_p2_53  <= 6'b0;
+            frac_p2_53 <= 22'b0;
+        end
+
+        else begin
+
+            sign_p2_53 <= sign_p1_53;
+
+            // Normalize mantissa
+            if (frac_p1_53[21]) begin
+
+                frac_p2_53 <= frac_p1_53;
+                exp_p2_53  <= exp_p1_53 + 1'b1;
+
+            end
+
+            else begin
+
+                frac_p2_53 <= frac_p1_53 << 1;
+                exp_p2_53  <= exp_p1_53;
+            end
+        end
+    end
+
+
+    // --------------------------------------------------------
+    // Stage 3: Rounding and Output
+    // --------------------------------------------------------
+
+    logic        guard_m53;
+    logic        round_m53;
+    logic        sticky_m53;
+    logic        round_up_m53;
+
+    logic [10:0] rounded_frac_m53;
+    logic [4:0]  final_exp_m53;
+
+    logic [15:0] prod_next53;
+
+    always_comb begin
+
+        if (frac_p2_53 == 0) begin
+
+            prod_next53 = 16'b0;
+        end
+
+        else begin
+
+            // Extract rounding bits
+            guard_m53  = frac_p2_53[10];
+            round_m53  = frac_p2_53[9];
+            sticky_m53 = |frac_p2_53[8:0];
+
+            // Round-to-nearest-even
+            round_up_m53 =
+                guard_m53 &&
+                (round_m53 ||
+                 sticky_m53 ||
+                 frac_p2_53[11]);
+
+
+            if (round_up_m53) begin
+
+                rounded_frac_m53 =
+                    frac_p2_53[20:11] + 1'b1;
+
+                // Mantissa overflow
+                if (rounded_frac_m53[10]) begin
+
+                    final_exp_m53 =
+                        exp_p2_53 + 1'b1;
+
+                    prod_next53 =
+                        {
+                            sign_p2_53,
+                            final_exp_m53,
+                            10'b0
+                        };
+
+                end
+
+                else begin
+
+                    prod_next53 =
+                        {
+                            sign_p2_53,
+                            exp_p2_53[4:0],
+                            rounded_frac_m53[9:0]
+                        };
+                end
+            end
+
+            else begin
+
+                prod_next53 =
+                    {
+                        sign_p2_53,
+                        exp_p2_53[4:0],
+                        frac_p2_53[20:11]
+                    };
+            end
+        end
+    }
+
+
+    // --------------------------------------------------------
+    // Output Register
+    // --------------------------------------------------------
+
+    always_ff @(posedge clk53 or posedge rst53) begin
+
+        if (rst53)
+            prod53 <= 16'b0;
+
+        else
+            prod53 <= prod_next53;
+    end
+
+endmodule
