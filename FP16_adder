@@ -1,0 +1,397 @@
+// ============================================================
+// FP16 Adder
+// Align -> Add/Subtract -> Normalize -> Round
+// ============================================================
+
+module fp16_add53 (
+    input  logic        clk53,
+    input  logic        rst53,
+    input  logic [15:0] a53,
+    input  logic [15:0] b53,
+    output logic [15:0] sum53
+);
+
+    // --------------------------------------------------------
+    // Stage 1: Unpack and Align
+    // --------------------------------------------------------
+
+    logic        sign_a53;
+    logic        sign_b53;
+
+    logic [4:0]  exp_a53;
+    logic [4:0]  exp_b53;
+
+    logic [10:0] mant_a53;
+    logic [10:0] mant_b53;
+
+    logic [4:0]  exp_diff53;
+    logic        swap53;
+
+    logic [26:0] temp_shift53;
+    logic [13:0] aligned_small53;
+
+    logic        sticky53;
+
+
+    always_comb begin
+
+        // Unpack operands
+        sign_a53 = a53[15];
+        sign_b53 = b53[15];
+
+        exp_a53 = a53[14:10];
+        exp_b53 = b53[14:10];
+
+
+        // Add hidden bit for normalized numbers
+        mant_a53 = (|exp_a53) ?
+                   {1'b1, a53[9:0]} :
+                   {1'b0, a53[9:0]};
+
+        mant_b53 = (|exp_b53) ?
+                   {1'b1, b53[9:0]} :
+                   {1'b0, b53[9:0]};
+
+
+        // Compare exponents and mantissas
+        if (
+            exp_a53 > exp_b53 ||
+            (exp_a53 == exp_b53 &&
+             mant_a53 >= mant_b53)
+        ) begin
+
+            swap53    = 1'b0;
+            exp_diff53 = exp_a53 - exp_b53;
+
+        end
+
+        else begin
+
+            swap53    = 1'b1;
+            exp_diff53 = exp_b53 - exp_a53;
+        end
+
+
+        // Align smaller mantissa
+        if (swap53) begin
+
+            temp_shift53 =
+                {mant_a53, 16'b0} >> exp_diff53;
+
+            if (exp_diff53 >= 14)
+                sticky53 = |mant_a53;
+
+            else
+                sticky53 =
+                    |({mant_a53, 16'b0}
+                     << (27 - exp_diff53));
+        end
+
+        else begin
+
+            temp_shift53 =
+                {mant_b53, 16'b0} >> exp_diff53;
+
+            if (exp_diff53 >= 14)
+                sticky53 = |mant_b53;
+
+            else
+                sticky53 =
+                    |({mant_b53, 16'b0}
+                     << (27 - exp_diff53));
+        end
+
+
+        aligned_small53 =
+            temp_shift53[26:13];
+
+        aligned_small53[0] =
+            aligned_small53[0] | sticky53;
+
+    end
+
+
+    // --------------------------------------------------------
+    // Stage 1 Register
+    // --------------------------------------------------------
+
+    logic        s1_sign_large53;
+    logic        s1_sign_b53;
+
+    logic [4:0]  s1_exp_large53;
+
+    logic [13:0] s1_frac_large53;
+    logic [13:0] s1_frac_small53;
+
+    logic        s1_sub_op53;
+
+
+    always_ff @(posedge clk53 or posedge rst53) begin
+
+        if (rst53) begin
+
+            s1_sign_large53 <= 1'b0;
+            s1_sign_b53     <= 1'b0;
+
+            s1_exp_large53 <= 5'b0;
+
+            s1_frac_large53 <= 14'b0;
+            s1_frac_small53 <= 14'b0;
+
+            s1_sub_op53 <= 1'b0;
+        end
+
+        else begin
+
+            s1_sign_large53 <=
+                swap53 ? sign_b53 : sign_a53;
+
+            s1_sign_b53 <=
+                swap53 ? sign_a53 : sign_b53;
+
+            s1_exp_large53 <=
+                swap53 ? exp_b53 : exp_a53;
+
+            s1_frac_large53 <=
+                swap53 ?
+                {mant_b53, 3'b0} :
+                {mant_a53, 3'b0};
+
+            s1_frac_small53 <=
+                aligned_small53;
+
+            s1_sub_op53 =
+                sign_a53 ^ sign_b53;
+        end
+    end
+
+
+    // --------------------------------------------------------
+    // Stage 2: Addition / Subtraction
+    // --------------------------------------------------------
+
+    logic        s2_sign53;
+    logic [4:0]  s2_exp53;
+    logic [14:0] s2_sum53;
+
+
+    always_ff @(posedge clk53 or posedge rst53) begin
+
+        if (rst53) begin
+
+            s2_sign53 <= 1'b0;
+            s2_exp53  <= 5'b0;
+            s2_sum53  <= 15'b0;
+
+        end
+
+        else begin
+
+            s2_sign53 <= s1_sign_large53;
+            s2_exp53  <= s1_exp_large53;
+
+            if (s1_sub_op53)
+                s2_sum53 <=
+                    s1_frac_large53 -
+                    s1_frac_small53;
+
+            else
+                s2_sum53 <=
+                    s1_frac_large53 +
+                    s1_frac_small53;
+        end
+    end
+
+
+    // --------------------------------------------------------
+    // Stage 3: Normalize and Round
+    // --------------------------------------------------------
+
+    logic [4:0]  final_exp53;
+    logic [14:0] norm_frac53;
+
+    logic [3:0]  lz_count53;
+
+    logic [15:0] result53;
+
+    logic        guard53;
+    logic        round_sticky53;
+    logic        round_up53;
+
+
+    always_comb begin
+
+        final_exp53 = s2_exp53;
+        norm_frac53 = s2_sum53;
+
+        lz_count53 = 4'd0;
+        result53   = 16'b0;
+
+
+        if (s2_sum53 != 0) begin
+
+            // ------------------------------------------------
+            // Check Overflow
+            // ------------------------------------------------
+
+            if (s2_sum53[14]) begin
+
+                norm_frac53 =
+                    s2_sum53 >> 1;
+
+                norm_frac53[0] =
+                    s2_sum53[0] |
+                    s2_sum53[1];
+
+                final_exp53 =
+                    final_exp53 + 1'b1;
+            end
+
+            else begin
+
+                // --------------------------------------------
+                // Leading Zero Count
+                // --------------------------------------------
+
+                if (norm_frac53[13] == 0) begin
+
+                    if (norm_frac53[12])
+                        lz_count53 = 1;
+
+                    else if (norm_frac53[11])
+                        lz_count53 = 2;
+
+                    else if (norm_frac53[10])
+                        lz_count53 = 3;
+
+                    else if (norm_frac53[9])
+                        lz_count53 = 4;
+
+                    else if (norm_frac53[8])
+                        lz_count53 = 5;
+
+                    else if (norm_frac53[7])
+                        lz_count53 = 6;
+
+                    else if (norm_frac53[6])
+                        lz_count53 = 7;
+
+                    else if (norm_frac53[5])
+                        lz_count53 = 8;
+
+                    else if (norm_frac53[4])
+                        lz_count53 = 9;
+
+                    else if (norm_frac53[3])
+                        lz_count53 = 10;
+
+                    else if (norm_frac53[2])
+                        lz_count53 = 11;
+
+                    else if (norm_frac53[1])
+                        lz_count53 = 12;
+
+                    else
+                        lz_count53 = 13;
+                }
+
+
+                // --------------------------------------------
+                // Normalize
+                // --------------------------------------------
+
+                if (lz_count53 > 0) begin
+
+                    if (lz_count53 >= final_exp53) begin
+
+                        norm_frac53 =
+                            norm_frac53 <<
+                            (final_exp53 - 1);
+
+                        final_exp53 = 0;
+                    end
+
+                    else begin
+
+                        norm_frac53 =
+                            norm_frac53 <<
+                            lz_count53;
+
+                        final_exp53 =
+                            final_exp53 -
+                            lz_count53;
+                    end
+                end
+            }
+
+
+            // ------------------------------------------------
+            // Round to Nearest Even
+            // ------------------------------------------------
+
+            guard53 =
+                norm_frac53[2];
+
+            round_sticky53 =
+                norm_frac53[1] |
+                norm_frac53[0];
+
+            round_up53 =
+                guard53 &
+                (round_sticky53 |
+                 norm_frac53[3]);
+
+
+            if (round_up53) begin
+
+                if (
+                    norm_frac53[13:3] ==
+                    11'b11111111111
+                ) begin
+
+                    result53 =
+                        {
+                            s2_sign53,
+                            final_exp53 + 5'd1,
+                            10'b0
+                        };
+                end
+
+                else begin
+
+                    result53 =
+                        {
+                            s2_sign53,
+                            final_exp53,
+                            norm_frac53[12:3] + 1'b1
+                        };
+                end
+            end
+
+            else begin
+
+                result53 =
+                    {
+                        s2_sign53,
+                        final_exp53,
+                        norm_frac53[12:3]
+                    };
+            end
+        end
+    }
+
+
+    // --------------------------------------------------------
+    // Stage 3 Output Register
+    // --------------------------------------------------------
+
+    always_ff @(posedge clk53 or posedge rst53) begin
+
+        if (rst53)
+            sum53 <= 16'b0;
+
+        else
+            sum53 <= result53;
+    end
+
+endmodule
